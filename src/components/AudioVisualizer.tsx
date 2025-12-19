@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type Mode = "idle" | "mic" | "tab";
 
@@ -16,7 +16,22 @@ function rmsTimeDomain(buf: Float32Array) {
   return Math.sqrt(sum / buf.length);
 }
 
-export default function AudioVisualizer() {
+function levelToColor(level: number): string {
+  // Convert level (0-1) to color from blue (240°) to red (0°/360°)
+  // Using HSL for smooth color transitions
+  const hue = 240 * (1 - level); // Blue (240) to Red (0)
+  const saturation = 80 + level * 20; // 80% to 100% saturation
+  const lightness = 50 + level * 10; // 50% to 60% lightness
+  return `hsl(${hue}, ${saturation}%, ${lightness}%)`;
+}
+
+export default function AudioVisualizer({
+  fullScreen,
+  setFullScreen,
+}: {
+  fullScreen: boolean;
+  setFullScreen: (fullScreen: boolean) => void;
+}) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -24,12 +39,15 @@ export default function AudioVisualizer() {
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef<number | null>(null);
+  const fadeOutStartRef = useRef<number | null>(null);
+  const fadeOutDurationRef = useRef<number>(1000); // 1 second fade-out
 
   const [mode, setMode] = useState<Mode>("idle");
   const [error, setError] = useState<string>("");
   const [isRunning, setIsRunning] = useState(false);
+  const [isFadingOut, setIsFadingOut] = useState(false);
 
-  const [fftSize, setFftSize] = useState(2048); // spectrum resolution
+  const [fftSize, setFftSize] = useState(4096); // spectrum resolution
   const [smoothing, setSmoothing] = useState(0.8);
   const [gainBoost, setGainBoost] = useState(1.0); // purely visual boost
   const [barCount, setBarCount] = useState(64);
@@ -52,6 +70,8 @@ export default function AudioVisualizer() {
 
   function cleanup() {
     setIsRunning(false);
+    setIsFadingOut(false);
+    fadeOutStartRef.current = null;
 
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = null;
@@ -118,7 +138,7 @@ export default function AudioVisualizer() {
 
       // getDisplayMedia with audio works best in Chromium.
       // User must select a tab/window and enable “Share audio”.
-   
+
       const stream: MediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: true, // required by many browsers to allow display capture
         audio: true,
@@ -143,7 +163,7 @@ export default function AudioVisualizer() {
     } catch (e: any) {
       setError(
         e?.message ??
-          "Failed to start tab/screen capture. Try Chrome/Edge and ensure “Share audio” is enabled."
+          "Failed to start tab/screen capture. Try Chrome/Edge and ensure 'Share audio' is enabled."
       );
       cleanup();
     }
@@ -151,13 +171,37 @@ export default function AudioVisualizer() {
 
   function stop() {
     setError("");
-    cleanup();
+    if (isRunning && !isFadingOut) {
+      // Disconnect audio sources but keep animation running for fade-out
+      try {
+        analyserRef.current?.disconnect();
+        sourceRef.current?.disconnect();
+      } catch {}
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+
+      sourceRef.current = null;
+      analyserRef.current = null;
+      setIsRunning(false);
+
+      // Start fade-out
+      setIsFadingOut(true);
+      fadeOutStartRef.current = performance.now();
+    } else {
+      // If already fading or not running, cleanup immediately
+      cleanup();
+    }
   }
 
   function loopDraw() {
     const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // Allow drawing during fade-out even if analyser is disconnected
     const analyser = analyserRef.current;
-    if (!canvas || !analyser) return;
 
     const ctx2d = canvas.getContext("2d");
     if (!ctx2d) return;
@@ -171,15 +215,35 @@ export default function AudioVisualizer() {
       canvas.height = h;
     }
 
-    const freqBins = analyser.frequencyBinCount;
+    // Use stored FFT size or default if analyser is gone (during fade-out)
+    const currentFftSize = analyser?.fftSize || fftSize;
+    const freqBins = analyser?.frequencyBinCount || currentFftSize / 2;
     const freqData = new Uint8Array(freqBins);
-    const timeData = new Float32Array(analyser.fftSize);
+    const timeData = new Float32Array(currentFftSize);
 
     const draw = () => {
-      if (!analyserRef.current) return;
+      // Calculate fade-out multiplier
+      let fadeMultiplier = 1.0;
+      if (isFadingOut && fadeOutStartRef.current !== null) {
+        const elapsed = performance.now() - fadeOutStartRef.current;
+        const progress = Math.min(elapsed / fadeOutDurationRef.current, 1.0);
+        fadeMultiplier = 1.0 - progress; // Fade from 1.0 to 0.0
 
-      analyserRef.current.getByteFrequencyData(freqData);
-      analyserRef.current.getFloatTimeDomainData(timeData);
+        // When fade-out is complete, cleanup
+        if (progress >= 1.0) {
+          cleanup();
+          return;
+        }
+      }
+
+      if (!analyserRef.current) {
+        // If analyser is gone but we're still drawing (during fade-out), use zero data
+        freqData.fill(0);
+        timeData.fill(0);
+      } else {
+        analyserRef.current.getByteFrequencyData(freqData);
+        analyserRef.current.getFloatTimeDomainData(timeData);
+      }
 
       // Background
       ctx2d.clearRect(0, 0, w, h);
@@ -190,12 +254,15 @@ export default function AudioVisualizer() {
       const gap = 14 * dpr;
 
       const spectrumX = padding + vuWidth + gap;
-      const spectrumY = padding;
       const spectrumW = w - spectrumX - padding;
       const spectrumH = h - padding * 2;
 
       // VU meter on the left
-      const rms = clamp(rmsTimeDomain(timeData) * gainBoost, 0, 1.25);
+      const rms = clamp(
+        rmsTimeDomain(timeData) * gainBoost * fadeMultiplier,
+        0,
+        1.25
+      );
       const vuLevel = clamp(rms / 1.0, 0, 1);
 
       // VU background
@@ -206,13 +273,13 @@ export default function AudioVisualizer() {
       const vuFillH = spectrumH * vuLevel;
       const vuFillY = padding + (spectrumH - vuFillH);
 
-      // Color-ish without hardcoding fancy palettes: just grayscale + a “peak” line
-      ctx2d.fillStyle = "rgba(255,255,255,0.75)";
+      // Color gradient based on VU level (blue to red)
+      ctx2d.fillStyle = levelToColor(vuLevel);
       ctx2d.fillRect(padding, vuFillY, vuWidth, vuFillH);
 
-      // Peak line
+      // Peak line - use red for high levels
       const peakY = clamp(vuFillY, padding, padding + spectrumH);
-      ctx2d.fillStyle = "rgba(255,255,255,0.95)";
+      ctx2d.fillStyle = levelToColor(Math.min(vuLevel + 0.2, 1));
       ctx2d.fillRect(padding, peakY, vuWidth, 2 * dpr);
 
       // Spectrum bars
@@ -236,13 +303,14 @@ export default function AudioVisualizer() {
           count++;
         }
         const v = sum / count / 255; // 0..1
-        const level = clamp(v * gainBoost, 0, 1);
+        const level = clamp(v * gainBoost * fadeMultiplier, 0, 1);
 
         const barH = spectrumH * level;
         const x = spectrumX + i * barW;
         const y = padding + (spectrumH - barH);
 
-        ctx2d.fillStyle = "rgba(255,255,255,0.65)";
+        // Color gradient based on bar level (blue to red)
+        ctx2d.fillStyle = levelToColor(level);
         ctx2d.fillRect(x + 1 * dpr, y, Math.max(1, barW - 2 * dpr), barH);
       }
 
@@ -272,33 +340,123 @@ export default function AudioVisualizer() {
       analyserRef.current.smoothingTimeConstant = smoothing;
   }, [smoothing]);
 
+  // Restart draw loop when switching to/from fullscreen if already running
+  useEffect(() => {
+    if (isRunning || isFadingOut) {
+      // Cancel existing animation frame
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+
+      // Small delay to ensure canvas is mounted and sized in new mode
+      const timeout = setTimeout(() => {
+        if (canvasRef.current && (isRunning || isFadingOut)) {
+          loopDraw();
+        }
+      }, 100);
+      return () => clearTimeout(timeout);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fullScreen]); // Only run when fullScreen changes, loopDraw is recreated each render
+
+  // Handle window resize to ensure canvas resizes properly
+  useEffect(() => {
+    const handleResize = () => {
+      if (canvasRef.current && (isRunning || isFadingOut)) {
+        // Force canvas resize by clearing and restarting if needed
+        const canvas = canvasRef.current;
+        const ctx2d = canvas.getContext("2d");
+        if (ctx2d) {
+          const dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+          const rect = canvas.getBoundingClientRect();
+          const w = Math.floor(rect.width * dpr);
+          const h = Math.floor(rect.height * dpr);
+          if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
+          }
+        }
+      }
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [isRunning, isFadingOut]);
+
   // Cleanup on unmount
   useEffect(() => {
     return () => cleanup();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return (
-    <div className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 shadow-sm">
+  return !fullScreen ? (
+    <div className="bg-zinc-900/40 p-4">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={startMic}
-            className="rounded-xl bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 active:bg-white/20"
+            className="rounded-xl inline-flex items-center gap-2 bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 active:bg-white/20"
           >
-            Start Mic
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="lucide lucide-mic-icon lucide-mic"
+            >
+              <path d="M12 19v3" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <rect x="9" y="2" width="6" height="13" rx="3" />
+            </svg>
+            <span>Start Mic</span>
           </button>
           <button
             onClick={startTabCapture}
-            className="rounded-xl bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 active:bg-white/20"
+            className="rounded-xl inline-flex items-center gap-2 bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 active:bg-white/20"
           >
-            Capture Tab/Screen Audio
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="lucide lucide-app-window-icon lucide-app-window"
+            >
+              <rect x="2" y="4" width="20" height="16" rx="2" />
+              <path d="M10 4v4" />
+              <path d="M2 8h20" />
+              <path d="M6 4v4" />
+            </svg>
+            <span>Capture Tab/Screen</span>
           </button>
           <button
             onClick={stop}
-            className="rounded-xl border border-white/10 bg-transparent px-4 py-2 text-sm font-medium hover:bg-white/5 active:bg-white/10"
+            className="rounded-xl inline-flex items-center gap-2 text-rose-500 border border-white/10 bg-transparent px-4 py-2 text-sm font-medium hover:bg-white/5 active:bg-white/10"
           >
-            Stop
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="lucide lucide-square-icon lucide-square"
+            >
+              <rect width="18" height="18" x="3" y="3" rx="2" />
+            </svg>
+            <span>Stop</span>
           </button>
 
           <span className="ml-1 text-xs text-zinc-400">
@@ -387,13 +545,66 @@ export default function AudioVisualizer() {
         <div className="mb-2 flex items-center justify-between">
           <span className="text-xs text-zinc-400">VU + Spectrum</span>
           <span className="text-xs text-zinc-500">Canvas / Web Audio API</span>
+          <button
+            onClick={() => setFullScreen(!fullScreen)}
+            className="rounded-xl inline-flex items-center gap-2 bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 active:bg-white/20"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="24"
+              height="24"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="lucide lucide-expand-icon lucide-expand"
+            >
+              <path d="m15 15 6 6" />
+              <path d="m15 9 6-6" />
+              <path d="M21 16v5h-5" />
+              <path d="M21 8V3h-5" />
+              <path d="M3 16v5h5" />
+              <path d="m3 21 6-6" />
+              <path d="M3 8V3h5" />
+              <path d="M9 9 3 3" />
+            </svg>
+          </button>
         </div>
 
         <canvas
           ref={canvasRef}
-          className="h-[320px] w-full rounded-xl border border-zinc-800 bg-zinc-950/40"
+          className="h-[calc(100vh-300px)] w-full rounded-xl bg-zinc-950/40"
         />
       </div>
+    </div>
+  ) : (
+    <div className="fixed inset-0 bg-zinc-950 z-50">
+      <canvas ref={canvasRef} className="h-full w-full" />
+      <button
+        onClick={() => setFullScreen(!fullScreen)}
+        className="absolute top-4 right-4 rounded-xl inline-flex items-center gap-2 bg-white/10 px-4 py-2 text-sm font-medium hover:bg-white/15 active:bg-white/20 backdrop-blur-sm"
+        title="Exit Fullscreen"
+      >
+        <svg
+          xmlns="http://www.w3.org/2000/svg"
+          width="24"
+          height="24"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="lucide lucide-minimize-2"
+        >
+          <polyline points="4 14 10 4 4 4 4 10" />
+          <polyline points="20 10 14 20 20 20 20 14" />
+          <line x1="14" y1="4" x2="20" y2="10" />
+          <line x1="4" y1="14" x2="10" y2="20" />
+        </svg>
+      </button>
     </div>
   );
 }
